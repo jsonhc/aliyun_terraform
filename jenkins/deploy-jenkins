@@ -316,4 +316,5 @@ jenkins-ingress   alb     jenkins.jsonjsonstart.dpdns.org   alb-5h5z805clcx999ch
 
 
 # 安装plugin
-git、pipeline、Pipeline: Job、Pipeline: Basic Steps、Pipeline: Stage Step、Pipeline: Build Step、Docker Pipeline、GitHub API、GitHub Branch Source
+git、pipeline、Pipeline: Job、Pipeline: Basic Steps、Pipeline: Stage Step、Pipeline: Build Step、Docker Pipeline、Pipeline: Stage View、GitHub API、GitHub Branch Source
+Kubernetes、
