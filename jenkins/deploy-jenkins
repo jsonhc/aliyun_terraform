@@ -1,0 +1,319 @@
+# 创建通用型nas
+获取server：121bqr9s11f1tdfr7h1-lce40.cn-hongkong.nas.aliyuncs.com
+
+# 创建pv、pvc
+root@chasel:~/ack/jenkins# cat pv.yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  annotations:
+    pv.kubernetes.io/bound-by-controller: 'yes'
+  finalizers:
+    - kubernetes.io/pv-protection
+  labels:
+    alicloud-pvname: pv-nas
+  name: pv-nas
+spec:
+  accessModes:
+    - ReadWriteMany
+  capacity:
+    storage: 20Gi
+  csi:
+    driver: nasplugin.csi.alibabacloud.com
+    volumeAttributes:
+      path: ''
+      server: 121bqr9s11f1tdfr7h1-lce40.cn-hongkong.nas.aliyuncs.com
+    volumeHandle: pv-nas
+  mountOptions:
+    - 'nolock,tcp,noresvport'
+    - vers=3
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: nas
+  volumeMode: Filesystem
+
+root@chasel:~/ack/jenkins# kubectl apply -f pv.yaml
+persistentvolume/pv-nas created
+root@chasel:~/ack/jenkins# kubectl get pv
+NAME     CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM             STORAGECLASS   VOLUMEATTRIBUTESCLASS   REASON   AGE
+pv-nas   20Gi       RWX            Retain           Bound    jenkins/pvc-nas   nas            <unset>                          3s
+
+root@chasel:~/ack/jenkins# kubectl create ns jenkins
+namespace/jenkins created
+
+root@chasel:~/ack/jenkins# cat pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  annotations:
+    pv.kubernetes.io/bind-completed: 'yes'
+    pv.kubernetes.io/bound-by-controller: 'yes'
+  name: pvc-nas
+  namespace: jenkins
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 20Gi
+  selector:
+    matchLabels:
+      alicloud-pvname: pv-nas
+  storageClassName: nas
+  volumeMode: Filesystem
+  volumeName: pv-nas
+root@chasel:~/ack/jenkins# kubectl apply -f pvc.yaml
+persistentvolumeclaim/pvc-nas created
+
+root@chasel:~/ack/jenkins# kubectl -n jenkins get pvc
+NAME      STATUS   VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+pvc-nas   Bound    pv-nas   20Gi       RWX            nas            <unset>                 2m22s
+
+# 部署Jenkins
+root@chasel:~/ack/jenkins# cat jenkins-01-serviceAccount.yaml
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jenkins-admin
+rules:
+  - apiGroups: [""]
+    resources: ["*"]
+    verbs: ["*"]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jenkins-admin
+  namespace: jenkins
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: jenkins-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: jenkins-admin
+subjects:
+- kind: ServiceAccount
+  name: jenkins-admin
+  namespace: jenkins
+
+root@chasel:~/ack/jenkins# kubectl apply -f jenkins-01-serviceAccount.yaml
+clusterrole.rbac.authorization.k8s.io/jenkins-admin created
+serviceaccount/jenkins-admin created
+clusterrolebinding.rbac.authorization.k8s.io/jenkins-admin created
+root@chasel:~/ack/jenkins# kubectl -n jenkins get sa
+NAME            AGE
+default         5m51s
+jenkins-admin   5s
+
+
+# deploy deployment
+root@chasel:~/ack/jenkins# cat jenkins-02-volume.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jenkins
+  namespace: jenkins
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jenkins-server
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: jenkins-server
+    spec:
+      securityContext:
+            fsGroup: 1000
+            runAsUser: 1000
+      serviceAccountName: jenkins-admin
+      containers:
+        - name: jenkins
+          image: jenkins/jenkins:lts
+          imagePullPolicy: Always
+          resources:
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+            requests:
+              memory: "500Mi"
+              cpu: "500m"
+          ports:
+            - name: httpport
+              containerPort: 8080
+            - name: jnlpport
+              containerPort: 50000
+          livenessProbe:
+            httpGet:
+              path: "/login"
+              port: 8080
+            initialDelaySeconds: 90
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: "/login"
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: jenkins-data
+              mountPath: /var/jenkins_home
+      volumes:
+        - name: jenkins-data
+          persistentVolumeClaim:
+              claimName: pvc-nas
+
+root@chasel:~/ack/jenkins# kubectl apply -f jenkins-02-volume.yaml
+deployment.apps/jenkins created
+
+root@chasel:~/ack/jenkins# kubectl -n jenkins get pod
+NAME                      READY   STATUS    RESTARTS   AGE
+jenkins-9ddd4f69c-hgsz4   1/1     Running   0          75s
+root@chasel:~/ack/jenkins# kubectl -n jenkins exec -it jenkins-9ddd4f69c-hgsz4 -- /bin/bash
+jenkins@jenkins-9ddd4f69c-hgsz4:/$ df -h
+Filesystem                                                Size  Used Avail Use% Mounted on
+overlay                                                    40G  8.5G   32G  22% /
+tmpfs                                                      64M     0   64M   0% /dev
+121bqr9s11f1tdfr7h1-lce40.cn-hongkong.nas.aliyuncs.com:/   10P  114M   10P   1% /var/jenkins_home
+/dev/vda3                                                  40G  8.5G   32G  22% /etc/hosts
+shm                                                        64M     0   64M   0% /dev/shm
+tmpfs                                                     2.0G   12K  2.0G   1% /run/secrets/kubernetes.io/serviceaccount
+tmpfs                                                     7.7G     0  7.7G   0% /proc/acpi
+tmpfs                                                     7.7G     0  7.7G   0% /proc/scsi
+tmpfs                                                     7.7G     0  7.7G   0% /sys/firmware
+
+root@chasel:~/ack/jenkins# cat jenkins-04-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: jenkins-service
+  namespace: jenkins
+spec:
+  selector:
+    app: jenkins-server
+  type: ClusterIP
+  ports:
+    - name: http
+      targetPort: 8080
+      port: 8080
+      protocol: TCP
+
+root@chasel:~/ack/jenkins# kubectl apply -f jenkins-04-service.yaml
+service/jenkins-service created
+root@chasel:~/ack/jenkins# kubectl -n jenkins get svc
+NAME              TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)    AGE
+jenkins-service   ClusterIP   192.168.38.102   <none>        8080/TCP   7s
+
+# 配置域名证书
+# 新增jenkins域名
+root@chasel:~/ack/jenkins# cat cluster-issuer.yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-cloudflare
+spec:
+  acme:
+    # Let's Encrypt 生产环境
+    server: https://acme-v02.api.letsencrypt.org/directory
+
+    email: jsonjsonstart@gmail.com  # 替换为你的邮箱
+
+    privateKeySecretRef:
+      name: letsencrypt-cloudflare-account-key
+
+    solvers:
+    - dns01:
+        cloudflare:
+          apiTokenSecretRef:
+            name: cloudflare-api-token
+            key: api-token
+      # 可选：指定哪些域名使用此 solver
+      selector:
+        dnsNames:
+        - "blog.jsonjsonstart.dpdns.org"
+        - "jenkins.jsonjsonstart.dpdns.org"
+
+root@chasel:~/ack/jenkins# kubectl apply -f cluster-issuer.yaml
+clusterissuer.cert-manager.io/letsencrypt-cloudflare configured
+
+# 创建Jenkins证书
+root@chasel:~/ack/jenkins# cat certificate.yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: jenkins-dpdns-org
+  namespace: jenkins
+spec:
+  secretName: jenkins-dpdns-org-tls  # 生成的 Secret 名称
+  issuerRef:
+    name: letsencrypt-cloudflare
+    kind: ClusterIssuer
+  dnsNames:
+  - jenkins.jsonjsonstart.dpdns.org
+
+root@chasel:~/ack/jenkins# kubectl apply -f certificate.yaml
+certificate.cert-manager.io/jenkins-dpdns-org created
+root@chasel:~/ack/jenkins# kubectl -n jenkins get secret
+NAME                      TYPE     DATA   AGE
+jenkins-dpdns-org-775rq   Opaque   1      12s
+
+# 创建ingress
+root@chasel:~/ack/jenkins# cat jenkins-ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "true"  # HTTP 重定向到 HTTPS
+  name: jenkins-ingress
+  namespace: jenkins
+spec:
+  ingressClassName: alb
+  tls:
+    - hosts:
+        - jenkins.jsonjsonstart.dpdns.org
+      secretName: jenkins-dpdns-org-tls
+  rules:
+    - host: jenkins.jsonjsonstart.dpdns.org
+      http:
+        paths:
+          - backend:
+              service:
+                name: jenkins-service
+                port:
+                  number: 8080
+            path: /
+            pathType: Prefix
+
+root@chasel:~/ack/jenkins# kubectl apply -f jenkins-ingress.yaml
+ingress.networking.k8s.io/jenkins-ingress created
+root@chasel:~/ack/jenkins# kubectl -n jenkins get ingress
+NAME              CLASS   HOSTS                             ADDRESS   PORTS     AGE
+jenkins-ingress   alb     jenkins.jsonjsonstart.dpdns.org             80, 443   12s
+
+# 查看ingress、albconfig
+root@chasel:~/ack/jenkins# kubectl -n jenkins get albconfig
+NAME   ALBID                    DNSNAME                                                      PORT&PROTOCOL   CERTID                 AGE
+alb    alb-5h5z805clcx999chld   alb-5h5z805clcx999chld.cn-hongkong.alb.aliyuncsslbintl.com   443/HTTPS       26159615-cn-hangzhou   138m
+root@chasel:~/ack/jenkins# kubectl -n jenkins get ingress
+NAME              CLASS   HOSTS                             ADDRESS                                                      PORTS     AGE
+jenkins-ingress   alb     jenkins.jsonjsonstart.dpdns.org   alb-5h5z805clcx999chld.cn-hongkong.alb.aliyuncsslbintl.com   80, 443   22s
+
+
+# 最后在cloudflare配置CNAME
+在jsonjsonstart.dpdns.org管理处dns解析记录配置CNAME，目标为阿里云ACK集群ALB的域名(alb-5h5z805clcx999chld.cn-hongkong.alb.aliyuncsslbintl.com)
+
+# 浏览器访问https://jenkins.jsonjsonstart.dpdns.org
+
+
+# 安装plugin
+git、pipeline、Pipeline: Job、Pipeline: Basic Steps、Pipeline: Stage Step、Pipeline: Build Step、Docker Pipeline、GitHub API、GitHub Branch Source

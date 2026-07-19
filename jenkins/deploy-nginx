@@ -1,0 +1,292 @@
+# deploy nginx
+root@chasel:~/ack# cat nginx-deploy.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  namespace: default
+  labels:
+    app: nginx
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: anolis-registry.cn-zhangjiakou.cr.aliyuncs.com/openanolis/nginx:1.14.1-8.6
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 80
+          protocol: TCP
+        resources:
+          requests:
+            cpu: 250m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 1
+
+# nginx service
+root@chasel:~/ack# cat nginx-svc.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: nginx
+  name: nginx-svc
+  namespace: default
+spec:
+  ports:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 80
+  selector:
+    app: nginx
+  type: ClusterIP
+
+# nginx ingress
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+  name: app-ingress
+  namespace: default
+spec:
+  ingressClassName: alb
+  rules:
+    - host: blog.jsonjsonstart.dpdns.org
+      http:
+        paths:
+          - backend:
+              service:
+                name: nginx-svc
+                port:
+                  number: 80
+            path: /
+            pathType: Prefix
+
+# 查看ingress
+root@chasel:~/ack# kubectl get ingress
+NAME          CLASS   HOSTS                          ADDRESS   PORTS   AGE
+app-ingress   alb     blog.jsonjsonstart.dpdns.org             80      78s
+
+# 查看albconfig
+root@chasel:~/ack# kubectl get albconfig
+NAME   ALBID                    DNSNAME                                                      PORT&PROTOCOL   CERTID   AGE
+alb    alb-5h5z805clcx999chld   alb-5h5z805clcx999chld.cn-hongkong.alb.aliyuncsslbintl.com                            40m
+
+在cloudflare平台上进行配置域名(blog.jsonjsonstart.dpdns.org)解析
+在jsonjsonstart.dpdns.org管理处dns解析记录配置CNAME，目标为阿里云ACK集群ALB的域名(alb-5h5z805clcx999chld.cn-hongkong.alb.aliyuncsslbintl.com)
+
+# 安装helm部署cert-manager
+root@chasel:~/ack# curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+root@chasel:~/ack# helm repo add jetstack https://charts.jetstack.io
+root@chasel:~/ack# helm install cert-manager jetstack/cert-manager --namespace cert-manager --create-namespace --version v1.14.0 --set installCRDs=true
+
+root@chasel:~/ack# kubectl get pods -n cert-manager
+NAME                                       READY   STATUS    RESTARTS   AGE
+cert-manager-7f6c5cb58f-jhdvb              1/1     Running   0          96s
+cert-manager-cainjector-58b845d8f4-fbj56   1/1     Running   0          96s
+cert-manager-webhook-7c87775984-4x7d4      1/1     Running   0          96s
+
+# 创建dns apitoken，配置cloud flare dns验证，创建cloudflare api token
+root@chasel:~/ack# kubectl -n cert-manager create secret generic cloudflare-api-token --from-literal=api-token=xxxxxxxxxxx
+secret/cloudflare-api-token created
+
+root@chasel:~/ack# kubectl -n cert-manager get secret
+NAME                                 TYPE                 DATA   AGE
+cert-manager-webhook-ca              Opaque               3      38m
+cloudflare-api-token                 Opaque               1      20m
+letsencrypt-cloudflare-account-key   Opaque               1      29m
+sh.helm.release.v1.cert-manager.v1   helm.sh/release.v1   1      38m
+
+root@chasel:~/ack# cat cluster-issuer.yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-cloudflare
+spec:
+  acme:
+    # Let's Encrypt 生产环境
+    server: https://acme-v02.api.letsencrypt.org/directory
+
+    email: jsonjsonstart@gmail.com  # 替换为你的邮箱
+
+    privateKeySecretRef:
+      name: letsencrypt-cloudflare-account-key
+
+    solvers:
+    - dns01:
+        cloudflare:
+          apiTokenSecretRef:
+            name: cloudflare-api-token
+            key: api-token
+      # 可选：指定哪些域名使用此 solver
+      selector:
+        dnsNames:
+        - "blog.jsonjsonstart.dpdns.org"
+
+root@chasel:~/ack# kubectl describe clusterissuer letsencrypt-cloudflare
+
+root@chasel:~/ack# cat certificate.yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: blog-dpdns-org
+  namespace: default
+spec:
+  secretName: blog-dpdns-org-tls  # 生成的 Secret 名称
+  issuerRef:
+    name: letsencrypt-cloudflare
+    kind: ClusterIssuer
+  dnsNames:
+  - blog.jsonjsonstart.dpdns.org
+
+root@chasel:~/ack# kubectl get secret
+NAME                 TYPE                DATA   AGE
+blog-dpdns-org-tls   kubernetes.io/tls   2      18m
+
+# 修改ingress增加证书tls
+root@chasel:~/ack# cat nginx-ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "true"  # HTTP 重定向到 HTTPS
+  name: app-ingress
+  namespace: default
+spec:
+  ingressClassName: alb
+  tls:
+    - hosts:
+        - blog.jsonjsonstart.dpdns.org
+      secretName: blog-dpdns-org-tls
+  rules:
+    - host: blog.jsonjsonstart.dpdns.org
+      http:
+        paths:
+          - backend:
+              service:
+                name: nginx-svc
+                port:
+                  number: 80
+            path: /
+            pathType: Prefix
+
+root@chasel:~/ack# kubectl apply -f nginx-ingress.yaml
+ingress.networking.k8s.io/app-ingress configured
+
+
+修改albconfig，新增443 HTTPS
+root@chasel:~/ack# kubectl get albconfig -o yaml
+apiVersion: v1
+items:
+- apiVersion: alibabacloud.com/v1
+  kind: AlbConfig
+  metadata:
+    creationTimestamp: "2026-07-19T09:07:50Z"
+    finalizers:
+    - ingress.k8s.alibaba/resources
+    generation: 2
+    labels:
+      alb.ingress.kubernetes.io/hash: 280271937df206ea8ff3232d68fc82a59a3172f453967ce30a415418
+    name: alb
+    resourceVersion: "33750"
+    uid: f3c3479d-2395-401e-833e-6e554ff9cb1d
+  spec:
+    config:
+      addressAllocatedMode: Fixed
+      addressType: Internet
+      zoneMappings:
+      - vSwitchId: vsw-j6ci320aibhphiopm6zg2
+      - vSwitchId: vsw-j6cb5bx9i8g0ehc5vms0o
+      - vSwitchId: vsw-j6c9wto6maa2vs8njjsr7
+    listeners:
+    - port: 80
+      protocol: HTTP
+    - port: 443         # 新增这两行
+      protocol: HTTPS
+  status:
+    loadBalancer:
+      dnsname: alb-5h5z805clcx999chld.cn-hongkong.alb.aliyuncsslbintl.com
+      id: alb-5h5z805clcx999chld
+      listeners:
+      - certificates:
+        - certificateId: 26159615-cn-hangzhou
+          isDefault: true
+        portAndProtocol: 443/HTTPS
+kind: List
+metadata:
+  resourceVersion: ""
+
+# 查看证书的请求状态：
+root@chasel:~/ack# kubectl describe certificate blog-dpdns-org -n default
+Events:
+  Type    Reason     Age   From                                       Message
+  ----    ------     ----  ----                                       -------
+  Normal  Issuing    21m   cert-manager-certificates-trigger          Issuing certificate as Secret does not exist
+  Normal  Generated  21m   cert-manager-certificates-key-manager      Stored new private key in temporary Secret resource "blog-dpdns-org-mnwk4"
+  Normal  Requested  21m   cert-manager-certificates-request-manager  Created new CertificateRequest resource "blog-dpdns-org-1"
+  Normal  Issuing    20m   cert-manager-certificates-issuing          The certificate has been successfully issued
+
+root@chasel:~/ack# kubectl get certificaterequest -n default
+NAME               APPROVED   DENIED   READY   ISSUER                   REQUESTOR                                         AGE
+blog-dpdns-org-1   True                True    letsencrypt-cloudflare   system:serviceaccount:cert-manager:cert-manager   22m
+
+# 查看证书信息
+root@chasel:~/ack# kubectl get secret blog-dpdns-org-tls -n default -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -text -noout
+Certificate:
+    Data:
+        Version: 3 (0x2)
+        Serial Number:
+            05:b6:ec:93:6c:f1:8d:a8:38:a9:c6:4c:25:45:23:14:d5:7f
+        Signature Algorithm: sha256WithRSAEncryption
+        Issuer: C = US, O = Let's Encrypt, CN = YR1
+        Validity
+            Not Before: Jul 19 09:18:31 2026 GMT
+            Not After : Oct 17 09:18:30 2026 GMT
+        Subject: CN = blog.jsonjsonstart.dpdns.org
+
+# 查看ingress：
+root@chasel:~/ack# kubectl describe ingress app-ingress
+Events:
+  Type     Reason                  Age                 From     Message
+  ----     ------                  ----                ----     -------
+  Warning  FailedBuildModel        24m (x15 over 53m)  ingress  listener is not exist in alb, port: 443, protocol: HTTPS
+  Warning  FailedBuildModel        16m (x7 over 20m)   ingress  none certificate found for host: blog.jsonjsonstart.dpdns.org
+  Normal   Sync                    14m (x18 over 53m)  ingress  Scheduled for sync
+  Normal   SuccessfullyReconciled  11m (x3 over 14m)   ingress  Successfully reconciled
+
+
+# 浏览器访问https://blog.jsonjsonstart.dpdns.org
