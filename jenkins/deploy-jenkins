@@ -318,3 +318,105 @@ jenkins-ingress   alb     jenkins.jsonjsonstart.dpdns.org   alb-5h5z805clcx999ch
 # 安装plugin
 git、pipeline、Pipeline: Job、Pipeline: Basic Steps、Pipeline: Stage Step、Pipeline: Build Step、Docker Pipeline、Pipeline: Stage View、GitHub API、GitHub Branch Source
 Kubernetes、
+
+配置jenkins到kubernetes的连接，并且创建sa调用
+root@chasel:~/ack/jenkins# cat sa.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jenkins-deployer
+  namespace: jenkins
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: jenkins-deployer-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin  # 或自定义最小权限 Role
+subjects:
+  - kind: ServiceAccount
+    name: jenkins-deployer
+    namespace: jenkins
+
+
+pipeline样例：
+pipeline {
+    agent {
+        kubernetes {
+            label 'jboss-build'
+            yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    jenkins: jboss-build
+spec:
+  containers:
+    # Jenkins Agent 容器（必须）
+    - name: jnlp
+      image: jenkins/inbound-agent:latest
+      resources:
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+    # Docker 构建容器
+    - name: docker
+      image: docker:24-dind
+      securityContext:
+        privileged: true  # 特权模式运行 Docker
+      volumeMounts:
+        - name: docker-graph
+          mountPath: /var/lib/docker
+
+  volumes:
+    # Docker 存储
+    - name: docker-graph
+      emptyDir: {}
+  
+  # 指定 ServiceAccount（需有部署权限）
+  serviceAccountName: jenkins-deployer
+"""
+        }
+    }
+    
+    environment {
+        // 镜像仓库地址（阿里云 ACR）
+        REGISTRY = 'registry.cn-hangzhou.aliyuncs.com'
+        NAMESPACE = 'jsonhc'
+        IMAGE_NAME = 'eap8'
+        ACR_USERNAME = credentials('acr-username')
+        ACR_PASSWORD = credentials('acr-password')
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    git(
+                        branch: 'main',
+                        url: 'https://github.com/jsonhc/jboss-eap8-jdk21.git',
+                        credentialsId: 'testprivateJenkins'
+                   )
+                }
+            }
+        }
+        stage('Build & Push Image') {
+            steps {
+                container('docker') {
+                    script {
+                        def imageTag = "${env.BUILD_NUMBER}"
+                        def imageFullName = "${REGISTRY}/${NAMESPACE}/${IMAGE_NAME}:${imageTag}"
+                        
+                        sh """
+                            docker build -t ${imageFullName} .
+                            docker login --username=\${ACR_USERNAME} --password=\${ACR_PASSWORD} ${REGISTRY}
+                            docker push ${imageFullName}
+                        """
+                    }
+                }
+            }
+        }
+    }
+}
